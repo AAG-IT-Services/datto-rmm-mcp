@@ -38,7 +38,7 @@ MCP server for Datto RMM, enabling Claude to interact with your Datto RMM accoun
 - **Alert Management**: View and resolve alerts
 - **Interactive Alert Card (MCP Apps)**: `datto_get_alert` renders as an interactive card in MCP Apps hosts (Claude Desktop/web) with an in-card "Resolve alert" round-trip; neutral by default, brandable via `window.__BRAND__` injection or `MCP_BRAND_*` env vars; plain-JSON behavior is unchanged in other hosts
 - **Site Management**: List and view site details
-- **Quick Jobs**: Run quick jobs on devices
+- **Quick Jobs**: Run quick jobs on devices and check their progress (status, per-device result, stdout/stderr)
 - **Audit Data**: Retrieve full device audit or software inventory
 
 ## Installation

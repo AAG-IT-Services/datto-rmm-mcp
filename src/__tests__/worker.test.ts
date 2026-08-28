@@ -85,6 +85,7 @@ describe("Cloudflare Worker entrypoint", () => {
     const names = (body.result?.tools ?? []).map((t) => t.name);
     expect(names).toContain("datto_list_devices");
     expect(names).toContain("datto_list_sites");
+    expect(names).toContain("datto_get_job");
     expect(names.length).toBeGreaterThan(5);
   });
 

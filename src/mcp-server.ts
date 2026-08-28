@@ -415,6 +415,33 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           },
         },
         {
+          name: "datto_get_job",
+          description:
+            "Get the status and progress of a job (e.g. one started by datto_run_quickjob). Pass deviceUid to also get that device's result (status, exit code, timing), and includeOutput to fetch its stdout/stderr.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              jobUid: {
+                type: "string",
+                description:
+                  "The job UID, returned as `uid` in the datto_run_quickjob response",
+              },
+              deviceUid: {
+                type: "string",
+                description:
+                  "Device UID to fetch this job's per-device result for. Required to fetch stdout/stderr.",
+              },
+              includeOutput: {
+                type: "boolean",
+                description:
+                  "Include the device's stdout/stderr for the job (requires deviceUid)",
+                default: false,
+              },
+            },
+            required: ["jobUid"],
+          },
+        },
+        {
           name: "datto_get_device_audit",
           description:
             "Get audit data for a device (hardware, software, OS information)",
@@ -716,6 +743,39 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           return {
             content: [
               { type: "text", text: JSON.stringify(result ?? {}, null, 2) },
+            ],
+          };
+        }
+
+        case "datto_get_job": {
+          const { jobUid, deviceUid, includeOutput } = args as {
+            jobUid: string;
+            deviceUid?: string;
+            includeOutput?: boolean;
+          };
+
+          const job = await client.jobs.get(jobUid);
+
+          let result: Awaited<ReturnType<typeof client.jobs.results>> | undefined;
+          let stdout: string | undefined;
+          let stderr: string | undefined;
+
+          if (deviceUid) {
+            result = await client.jobs.results(jobUid, deviceUid);
+            if (includeOutput) {
+              [stdout, stderr] = await Promise.all([
+                client.jobs.stdout(jobUid, deviceUid),
+                client.jobs.stderr(jobUid, deviceUid),
+              ]);
+            }
+          }
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ job, result, stdout, stderr }, null, 2),
+              },
             ],
           };
         }
