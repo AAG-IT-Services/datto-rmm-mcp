@@ -701,13 +701,17 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
 
           const jobRequest = {
             jobName,
-            componentUid,
-            variables,
+            jobComponent: {
+              componentUid,
+              variables: variables
+                ? Object.entries(variables).map(([name, value]) => ({ name, value }))
+                : [],
+            },
           };
 
           const result = await client.devices.createQuickJob(
             deviceUid,
-            jobRequest
+            jobRequest as unknown as Parameters<typeof client.devices.createQuickJob>[1]
           );
           return {
             content: [
