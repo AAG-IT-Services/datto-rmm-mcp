@@ -388,6 +388,26 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           },
         },
         {
+          name: "datto_get_site_variables",
+          description:
+            "List the site-level variables configured for a site (name, value, masked flag). Masked variable values are returned as Datto RMM provides them. Use datto_list_sites to resolve a site UID.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              siteUid: {
+                type: "string",
+                description: "The site UID",
+              },
+              name: {
+                type: "string",
+                description:
+                  "Optional variable name to return a single variable (case-insensitive exact match)",
+              },
+            },
+            required: ["siteUid"],
+          },
+        },
+        {
           name: "datto_run_quickjob",
           description: "Run a quick job on a device",
           inputSchema: {
@@ -715,6 +735,51 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           const site = await client.sites.get(siteUid);
           return {
             content: [{ type: "text", text: JSON.stringify(site, null, 2) }],
+          };
+        }
+
+        case "datto_get_site_variables": {
+          const { siteUid, name: variableName } = args as {
+            siteUid: string;
+            name?: string;
+          };
+          const variables = (await client.sites.variables(siteUid)) ?? [];
+
+          if (variableName) {
+            const needle = variableName.trim().toLowerCase();
+            const match = variables.filter(
+              (v) => v.name?.trim().toLowerCase() === needle
+            );
+            // Explicit not-found error instead of an empty success.
+            if (match.length === 0) {
+              return {
+                content: [
+                  {
+                    type: "text",
+                    text: `No variable named "${variableName}" found in site ${siteUid}. Omit name to list all site variables.`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+            return {
+              content: [
+                { type: "text", text: JSON.stringify(match[0], null, 2) },
+              ],
+            };
+          }
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { count: variables.length, variables },
+                  null,
+                  2
+                ),
+              },
+            ],
           };
         }
 

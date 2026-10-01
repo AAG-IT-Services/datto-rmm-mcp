@@ -7,6 +7,7 @@ const mockSitesGet = vi.fn();
 const mockSitesDevices = vi.fn();
 const mockSitesDevicesAll = vi.fn();
 const mockSitesAlertsOpenAll = vi.fn();
+const mockSitesVariables = vi.fn();
 const mockAlertsResolve = vi.fn();
 const mockAuditDevice = vi.fn();
 const mockAuditDeviceSoftware = vi.fn();
@@ -28,6 +29,7 @@ vi.mock('@wyre-technology/node-datto-rmm', () => ({
         devices: mockSitesDevices,
         devicesAll: mockSitesDevicesAll,
         alertsOpenAll: mockSitesAlertsOpenAll,
+        variables: mockSitesVariables,
       },
       alerts: {
         resolve: mockAlertsResolve,
@@ -534,6 +536,37 @@ describe('Datto RMM MCP Server', () => {
       });
     });
 
+    describe('datto_get_site_variables', () => {
+      it('should return variables for a site', async () => {
+        const mockVariables = [
+          { id: 'var-1', name: 'ClientCode', value: 'AAG', masked: false },
+          { id: 'var-2', name: 'AdminPassword', value: '*****', masked: true },
+        ];
+
+        mockSitesVariables.mockResolvedValue(mockVariables);
+
+        const result = await mockSitesVariables('site-123');
+
+        expect(mockSitesVariables).toHaveBeenCalledWith('site-123');
+        expect(result).toHaveLength(2);
+        expect(result[1].masked).toBe(true);
+      });
+
+      it('should require siteUid', () => {
+        const inputSchema = {
+          type: 'object',
+          properties: {
+            siteUid: { type: 'string', description: 'The site UID' },
+            name: { type: 'string' },
+          },
+          required: ['siteUid'],
+        };
+
+        expect(inputSchema.required).toContain('siteUid');
+        expect(inputSchema.required).not.toContain('name');
+      });
+    });
+
     describe('datto_run_quickjob', () => {
       it('should run a quick job on a device', async () => {
         const mockJobResult = {
@@ -776,12 +809,13 @@ describe('Datto RMM MCP Server', () => {
       'datto_resolve_alert',
       'datto_list_sites',
       'datto_get_site',
+      'datto_get_site_variables',
       'datto_run_quickjob',
       'datto_get_device_audit',
     ];
 
-    it('should define all 9 tools', () => {
-      expect(expectedTools).toHaveLength(9);
+    it('should define all 10 tools', () => {
+      expect(expectedTools).toHaveLength(10);
     });
 
     it('should include device management tools', () => {
@@ -794,6 +828,7 @@ describe('Datto RMM MCP Server', () => {
     it('should include site management tools', () => {
       expect(expectedTools).toContain('datto_list_sites');
       expect(expectedTools).toContain('datto_get_site');
+      expect(expectedTools).toContain('datto_get_site_variables');
     });
 
     it('should include alert management tools', () => {
