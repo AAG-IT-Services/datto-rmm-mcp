@@ -810,12 +810,13 @@ describe('Datto RMM MCP Server', () => {
       'datto_list_sites',
       'datto_get_site',
       'datto_get_site_variables',
+      'datto_list_components',
       'datto_run_quickjob',
       'datto_get_device_audit',
     ];
 
-    it('should define all 10 tools', () => {
-      expect(expectedTools).toHaveLength(10);
+    it('should define all 11 tools', () => {
+      expect(expectedTools).toHaveLength(11);
     });
 
     it('should include device management tools', () => {
@@ -837,6 +838,7 @@ describe('Datto RMM MCP Server', () => {
     });
 
     it('should include job management tools', () => {
+      expect(expectedTools).toContain('datto_list_components');
       expect(expectedTools).toContain('datto_run_quickjob');
     });
   });
