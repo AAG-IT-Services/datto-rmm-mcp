@@ -408,6 +408,26 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           },
         },
         {
+          name: "datto_list_components",
+          description:
+            "List the components (scripts/jobs) available in the account. Use this to find a component's UID for datto_run_quickjob. Supports an optional case-insensitive name filter.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              name: {
+                type: "string",
+                description:
+                  "Optional case-insensitive substring to filter components by name",
+              },
+              max: {
+                type: "number",
+                description: "Maximum number of results (default: 50)",
+                default: 50,
+              },
+            },
+          },
+        },
+        {
           name: "datto_run_quickjob",
           description: "Run a quick job on a device",
           inputSchema: {
@@ -775,6 +795,36 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
                 type: "text",
                 text: JSON.stringify(
                   { count: variables.length, variables },
+                  null,
+                  2
+                ),
+              },
+            ],
+          };
+        }
+
+        case "datto_list_components": {
+          const { name: nameFilter, max: maxParam } = args as {
+            name?: string;
+            max?: number;
+          };
+          const max = maxParam || 50;
+          const needle = nameFilter?.trim().toLowerCase();
+          // When filtering, scan a wider window so matches beyond the first
+          // page are not missed, then apply the max to the filtered result.
+          const all = await collectItems(
+            client.account.componentsAll(),
+            needle ? 1000 : max
+          );
+          const components = (all ?? [])
+            .filter((c) => !needle || c.name?.toLowerCase().includes(needle))
+            .slice(0, max);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { count: components.length, components },
                   null,
                   2
                 ),

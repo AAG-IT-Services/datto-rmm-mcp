@@ -102,6 +102,7 @@ Datto RMM uses regional API endpoints. Select the platform that matches your acc
 | `datto_list_sites` | List all sites |
 | `datto_get_site` | Get site details |
 | `datto_get_site_variables` | List a site's variables, or fetch one by name |
+| `datto_list_components` | List available components, optionally filtered by name |
 | `datto_run_quickjob` | Run a quick job on a device |
 | `datto_get_device_audit` | Get device audit data (full or software only) |
 
