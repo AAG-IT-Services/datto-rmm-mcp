@@ -19,9 +19,11 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import {
   DattoRmmClient,
+  type Component,
   type Device,
   type Platform,
-} from "@wyre-technology/node-datto-rmm";
+  type QuickJobRequest,
+} from "@wyre-ai/node-datto-rmm";
 import { elicitSelection } from "./utils/elicitation.js";
 import {
   ALERT_CARD_META,
@@ -32,6 +34,12 @@ import {
   buildAlertCard,
 } from "./alert-card.js";
 import { ALERT_CARD_HTML } from "./generated/alert-card-html.js";
+import { getDevicePatches, getSitePatches } from "./patches.js";
+import { listDeviceJobs } from "./device-jobs.js";
+import {
+  applyUntrustedContentMarkers,
+  type ToolResultLike,
+} from "./untrusted-content.js";
 
 // ---------------------------------------------------------------------------
 // Credentials
@@ -216,6 +224,115 @@ export async function findDevicesByHostname(
 }
 
 // ---------------------------------------------------------------------------
+// Component catalogue
+// ---------------------------------------------------------------------------
+
+/**
+ * The published `@wyre-ai/node-datto-rmm@1.1.0` `Component` type is a
+ * good-faith guess at the `GET /v2/account/components` response shape, not
+ * a verified spec. Confirmed live against a real account (2026-09-26,
+ * `GET /account/components?max=250`, 250+ components inspected): every
+ * component has exactly `id`, `credentialsRequired`, `uid`, `name`,
+ * `description`, `categoryCode`, `variables` — there is no `level` or
+ * `category` field at all. Datto does not expose a component's security
+ * Level over this endpoint (see the tool description for what that means
+ * for diagnosing datto_run_quickjob failures). `category` is kept as a
+ * defensive fallback in case a differently-configured account or API
+ * version ever sends it instead (see `RawDevice` above for the same
+ * pattern), but `categoryCode` is what the live API actually returns.
+ *
+ * The SDK doesn't declare `variables` on `Component` at all, and its shape
+ * isn't documented anywhere in the SDK's types, so each entry is read
+ * defensively field-by-field in toComponentVariableSummary below.
+ */
+type RawComponent = Component & {
+  categoryCode?: string;
+  credentialsRequired?: boolean;
+  variables?: unknown[];
+};
+
+/**
+ * Compact summary of one of a component's expected input variables — what
+ * datto_run_quickjob's `variables` map needs to be filled in with to run
+ * this component. The SDK doesn't type this shape, so every field is read
+ * defensively and only included when present.
+ */
+export interface ComponentVariableSummary {
+  name?: string;
+  type?: string;
+  defaultValue?: string;
+  description?: string;
+}
+
+function toComponentVariableSummary(raw: unknown): ComponentVariableSummary {
+  const v = (raw ?? {}) as Record<string, unknown>;
+  const summary: ComponentVariableSummary = {};
+  if (typeof v.name === "string") summary.name = v.name;
+  if (typeof v.type === "string") summary.type = v.type;
+  const defaultValue = v.defaultValue ?? v.default ?? v.value;
+  if (typeof defaultValue === "string") summary.defaultValue = defaultValue;
+  if (typeof v.description === "string") summary.description = v.description;
+  return summary;
+}
+
+/** Component summary returned by datto_list_components. */
+export interface ComponentMatch {
+  uid: string;
+  name: string;
+  description?: string;
+  categoryCode?: string;
+  credentialsRequired?: boolean;
+  variables?: ComponentVariableSummary[];
+}
+
+function toComponentMatch(component: Component): ComponentMatch {
+  const raw = component as RawComponent;
+  return {
+    uid: component.uid,
+    name: component.name,
+    description: component.description,
+    categoryCode: raw.categoryCode ?? raw.category,
+    credentialsRequired: raw.credentialsRequired,
+    variables: Array.isArray(raw.variables)
+      ? raw.variables.map(toComponentVariableSummary)
+      : undefined,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Quick job payload shape
+// ---------------------------------------------------------------------------
+
+/**
+ * The correct `POST/PUT .../device/{uid}/quickjob` request body, verified
+ * empirically against the live Datto RMM API (2026-09-14). The API rejects
+ * the flat shape the published `@wyre-ai/node-datto-rmm@1.1.0` types declare
+ * (`{ jobName, componentUid, variables }`) with HTTP 400
+ * `{"errorMessage":"Failed to read request"}` — it never parses and no job
+ * is created. It requires `componentUid` and `variables` nested under
+ * `jobComponent`, with `variables` as an ARRAY of `{name, value}` pairs
+ * rather than a key/value map:
+ *
+ *   { jobName, jobComponent: { componentUid, variables: [{name, value}] } }
+ *
+ * The SDK's `createQuickJob` forwards the request body verbatim, so this
+ * nested shape works at runtime today even though the library's exported
+ * `QuickJobRequest` type is still the wrong flat one. A fix to the library
+ * itself is pending upstream but not yet published. Once
+ * `@wyre-ai/node-datto-rmm` publishes the corrected type, remove this local
+ * interface and the `as unknown as QuickJobRequest` cast at the call site
+ * below — do NOT "simplify" the payload back to the flat shape, it will
+ * start failing against the real API again.
+ */
+interface QuickJobRequestBody {
+  jobName: string;
+  jobComponent: {
+    componentUid: string;
+    variables: { name: string; value: string }[];
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Server factory — creates a fresh server per request (stateless HTTP mode)
 // ---------------------------------------------------------------------------
 
@@ -226,7 +343,89 @@ export async function findDevicesByHostname(
  * elicitation helpers (`utils/elicitation.ts`) resolve the right server
  * even after await gaps. See `utils/server-ref.ts` for why this matters.
  */
-export function createMcpServer(credentialOverrides?: DattoCredentials): Server {
+/**
+ * Who is calling, when the server is fronted by a gateway that authenticates
+ * end users itself.
+ *
+ * The Datto RMM API has no impersonation: every job records the API account
+ * that created it, never the person who asked for it. On a shared service
+ * account that makes the job history useless for answering "who ran this?" —
+ * every entry names the integration. Carrying the caller's identity into the
+ * job NAME is the only attribution the API allows.
+ *
+ * ADVISORY, not enforced. It affects labelling only, never authorization, and
+ * a deployment without a gateway simply leaves it unset.
+ */
+export interface RequestContext {
+  /** UPN/email of the end user, from the gateway. */
+  callerUpn?: string;
+}
+
+/** Longest UPN carried into a job name. Real ones are far shorter; this only
+ *  stops a malformed value from dominating the console's activity list. */
+const MAX_CALLER_UPN_LENGTH = 64;
+
+/**
+ * Makes a gateway-supplied UPN safe to embed in a job name.
+ *
+ * Square brackets are removed, and that is the part that matters. The
+ * attribution suffix is bracket-delimited, so a UPN containing `]` could
+ * close it early and open a second one - `x] [admin@corp` would render as
+ * `Job [x] [admin@corp]` and read as though the admin had run the job. It
+ * would also defeat the idempotency check below. Real UPNs never contain
+ * brackets, so removing them costs nothing.
+ *
+ * Control characters go too (they corrupt the console's rendering and this
+ * log line), and the result is capped.
+ *
+ * @param raw - UPN as received from the gateway, if any.
+ * @returns A UPN safe to embed, or undefined if nothing usable remains.
+ */
+function sanitizeCallerUpn(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  // eslint-disable-next-line no-control-regex
+  const cleaned = raw.replace(/[\x00-\x1f\x7f[\\\]]/g, "").trim();
+  if (!cleaned) return undefined;
+  return cleaned.slice(0, MAX_CALLER_UPN_LENGTH);
+}
+
+/**
+ * Appends ` [upn]` so a job in the Datto console names the human behind it.
+ *
+ * The suffix is always the gateway's own attribution and always last. A
+ * caller-supplied name that already ends in some other bracketed text keeps
+ * it and gains the attribution after it (`Job [ticket-12] [someone@corp]`) -
+ * that text is part of the name the caller chose, not a competing claim about
+ * who ran the job.
+ *
+ * @param jobName - Name as supplied by the caller.
+ * @param callerUpn - Sanitized caller identity, if the gateway supplied one.
+ * @returns The job name, attributed when a caller is known.
+ */
+function attributeJobName(jobName: string, callerUpn?: string): string {
+  const upn = sanitizeCallerUpn(callerUpn);
+  if (!upn) return jobName;
+  // Idempotent: a retry, or a caller that already attributed the name, must
+  // not accumulate duplicate suffixes.
+  if (jobName.endsWith(`[${upn}]`)) return jobName;
+  return `${jobName} [${upn}]`;
+}
+
+/**
+ * Creates an MCP server instance for a single request.
+ *
+ * @param credentialOverrides - Datto credentials for this request. Supplied
+ * per request in gateway mode; falls back to the process environment
+ * otherwise.
+ * @param requestContext - Caller identity from the gateway, used to attribute
+ * created quick jobs. Labelling only - never authorization.
+ * @returns A configured server, to be connected to a transport and closed
+ * when the request completes.
+ */
+export function createMcpServer(
+  credentialOverrides?: DattoCredentials,
+  requestContext?: RequestContext
+): Server {
   const server = new Server(
     {
       name: "datto-rmm-mcp",
@@ -236,6 +435,9 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
       capabilities: {
         tools: {},
         resources: {},
+        extensions: {
+          "io.modelcontextprotocol/ui": {},
+        },
       },
     }
   );
@@ -247,6 +449,7 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           name: "datto_list_devices",
           description:
             "List all devices in Datto RMM. Can filter by site. To look up a single device by hostname, use datto_find_device instead.",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
@@ -267,6 +470,7 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           name: "datto_find_device",
           description:
             "Find a device by hostname and return its UID plus a lightweight summary. Use this before datto_get_device when the user provides a hostname instead of a UID.",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
@@ -299,6 +503,7 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           name: "datto_get_device",
           description:
             "Get full details for a specific device by its UID. If you only have a hostname, call datto_find_device first to resolve the UID.",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
@@ -313,6 +518,7 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         {
           name: "datto_list_alerts",
           description: "List open alerts. Can filter by site.",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
@@ -332,6 +538,7 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         {
           name: "datto_get_alert",
           description: "Get details for a specific alert by its UID",
+          annotations: { readOnlyHint: true },
           _meta: ALERT_CARD_META,
           inputSchema: {
             type: "object",
@@ -362,6 +569,7 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         {
           name: "datto_list_sites",
           description: "List all sites in the account",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
@@ -376,6 +584,7 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         {
           name: "datto_get_site",
           description: "Get details for a specific site by its UID",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
@@ -391,6 +600,7 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           name: "datto_get_site_variables",
           description:
             "List the site-level variables configured for a site (name, value, masked flag). Masked variable values are returned as Datto RMM provides them. Use datto_list_sites to resolve a site UID.",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
@@ -410,14 +620,15 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         {
           name: "datto_list_components",
           description:
-            "List the components (scripts/jobs) available in the account. Use this to find a component's UID for datto_run_quickjob. Supports an optional case-insensitive name filter.",
+            "List components (the scripts/monitors available to run as quick jobs) in the account, optionally filtered by a case-insensitive substring of the name. Use this to find a componentUid for datto_run_quickjob — otherwise there's no way to get one short of the Datto RMM web UI. Each result's `variables` lists what datto_run_quickjob's `variables` map needs to be filled in with to run that component. A quickjob HTTP 500 usually means the API user's security role is below the component's Level (Datto returns 500 where 403 belongs). The API does not expose component Level; check it in the RMM web UI under the component's settings before blaming the payload.",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
               name: {
                 type: "string",
                 description:
-                  "Optional case-insensitive substring to filter components by name",
+                  'Case-insensitive substring filter on component name, e.g. "disk" or "cleanup". Applied across every page of the account\'s component catalogue before truncating to max, so a match on a later page isn\'t missed.',
               },
               max: {
                 type: "number",
@@ -429,7 +640,8 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         },
         {
           name: "datto_run_quickjob",
-          description: "Run a quick job on a device",
+          description:
+            "Run a quick job on a device. Returns a job UID — pass it to datto_get_job, datto_get_job_components, datto_get_job_results, datto_get_job_stdout, and datto_get_job_stderr to check the job's status and retrieve its output, since this call itself is fire-and-forget.",
           inputSchema: {
             type: "object",
             properties: {
@@ -457,34 +669,136 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         {
           name: "datto_get_job",
           description:
-            "Get the status and progress of a job (e.g. one started by datto_run_quickjob). Pass deviceUid to also get that device's result (status, exit code, timing), and includeOutput to fetch its stdout/stderr.",
+            "Get status and details for a quick job by its UID (e.g. queued/running/completed, device count, timestamps). Use this after datto_run_quickjob to check whether the job finished and how it went.",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
               jobUid: {
                 type: "string",
-                description:
-                  "The job UID, returned as `uid` in the datto_run_quickjob response",
-              },
-              deviceUid: {
-                type: "string",
-                description:
-                  "Device UID to fetch this job's per-device result for. Required to fetch stdout/stderr.",
-              },
-              includeOutput: {
-                type: "boolean",
-                description:
-                  "Include the device's stdout/stderr for the job (requires deviceUid)",
-                default: false,
+                description: "The job UID, returned by datto_run_quickjob",
               },
             },
             required: ["jobUid"],
           },
         },
         {
+          name: "datto_get_job_components",
+          description:
+            "Get the components (scripts/actions and their variables) that make up a quick job",
+          annotations: { readOnlyHint: true },
+          inputSchema: {
+            type: "object",
+            properties: {
+              jobUid: {
+                type: "string",
+                description: "The job UID",
+              },
+            },
+            required: ["jobUid"],
+          },
+        },
+        {
+          name: "datto_get_job_results",
+          description:
+            "Get the result of a quick job on one specific device — status, exit code, timing, and error message if it failed. Use datto_get_job first if you need to find which devices the job ran on.",
+          annotations: { readOnlyHint: true },
+          inputSchema: {
+            type: "object",
+            properties: {
+              jobUid: {
+                type: "string",
+                description: "The job UID",
+              },
+              deviceUid: {
+                type: "string",
+                description: "The device UID to get the job result for",
+              },
+            },
+            required: ["jobUid", "deviceUid"],
+          },
+        },
+        {
+          name: "datto_get_job_stdout",
+          description:
+            "Get the captured stdout output of a quick job on a specific device. Use this to diagnose what a script actually printed when a quick job's outcome is unclear.",
+          annotations: { readOnlyHint: true },
+          inputSchema: {
+            type: "object",
+            properties: {
+              jobUid: {
+                type: "string",
+                description: "The job UID",
+              },
+              deviceUid: {
+                type: "string",
+                description: "The device UID",
+              },
+            },
+            required: ["jobUid", "deviceUid"],
+          },
+        },
+        {
+          name: "datto_get_job_stderr",
+          description:
+            "Get the captured stderr output of a quick job on a specific device. Use this to diagnose why a quick job failed.",
+          annotations: { readOnlyHint: true },
+          inputSchema: {
+            type: "object",
+            properties: {
+              jobUid: {
+                type: "string",
+                description: "The job UID",
+              },
+              deviceUid: {
+                type: "string",
+                description: "The device UID",
+              },
+            },
+            required: ["jobUid", "deviceUid"],
+          },
+        },
+        {
+          name: "datto_list_device_jobs",
+          description:
+            "List the jobs (quick jobs and scheduled jobs) that ran on a device, newest first, from the Datto RMM activity log. Use this to find a jobUid when you don't already have one, e.g. \"the last Get-NitroPDFInfo run on device X\" - then pass the jobUid and deviceUid to datto_get_job_results, datto_get_job_stdout or datto_get_job_stderr. Defaults to the last 7 days. Each row has the jobUid, job name, component name(s), deployment time and, for the job's most recent run, its status and run time. Datto RMM keeps results and output only for a job's LATEST run on a device, so for a recurring job the older rows carry no status and the output tools return the latest run. The API exposes no job end time. Requires the API user to have the Audit: View permission. If you only have a hostname, call datto_find_device first.",
+          annotations: { readOnlyHint: true },
+          inputSchema: {
+            type: "object",
+            properties: {
+              deviceUid: {
+                type: "string",
+                description: "The device UID",
+              },
+              since: {
+                type: "string",
+                description:
+                  "Start of the window, ISO 8601 date or date-time (UTC if no offset), e.g. 2026-11-01. Defaults to 7 days before until.",
+              },
+              until: {
+                type: "string",
+                description:
+                  "End of the window, ISO 8601 date or date-time. Defaults to now.",
+              },
+              name: {
+                type: "string",
+                description:
+                  'Case-insensitive substring filter on the job name or its component name(s), e.g. "NitroPDF".',
+              },
+              max: {
+                type: "number",
+                description: "Maximum number of job runs to return (default: 25, max: 100)",
+                default: 25,
+              },
+            },
+            required: ["deviceUid"],
+          },
+        },
+        {
           name: "datto_get_device_audit",
           description:
             "Get audit data for a device (hardware, software, OS information)",
+          annotations: { readOnlyHint: true },
           inputSchema: {
             type: "object",
             properties: {
@@ -501,6 +815,38 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
               },
             },
             required: ["deviceUid"],
+          },
+        },
+        {
+          name: "datto_get_device_patches",
+          description:
+            "Get Windows patch installation status for a device - per-patch installed/missing/pending status, severity, reboot requirement, and KB article",
+          annotations: { readOnlyHint: true },
+          inputSchema: {
+            type: "object",
+            properties: {
+              deviceUid: {
+                type: "string",
+                description: "The device UID",
+              },
+            },
+            required: ["deviceUid"],
+          },
+        },
+        {
+          name: "datto_get_site_patches",
+          description:
+            "Get Windows patch installation status across all devices in a site",
+          annotations: { readOnlyHint: true },
+          inputSchema: {
+            type: "object",
+            properties: {
+              siteUid: {
+                type: "string",
+                description: "The site UID",
+              },
+            },
+            required: ["siteUid"],
           },
         },
       ],
@@ -559,7 +905,11 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
 
     const client = createClient(creds);
 
-    try {
+    // Every branch below returns raw tool output; wrapping happens once,
+    // after this IIFE settles, via applyUntrustedContentMarkers — see
+    // untrusted-content.ts for why and for which tools.
+    const result = await (async (): Promise<ToolResultLike> => {
+      try {
       switch (name) {
         case "datto_list_devices": {
           const params = args as { siteUid?: string; max?: number };
@@ -721,11 +1071,13 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           // MCP Apps: attach the normalized payload the ui:// alert card
           // renders from. Best-effort — a null card just means no UI surface.
           const card = buildAlertCard(alert);
-          const payload = card ? { ...alert, _card: card } : alert;
+          const structuredContent = card ? { ...alert, _card: card } : alert;
+          const summary = card
+            ? `Alert on ${card.device}: ${card.title} (${card.priority}, ${card.status})`
+            : `Alert ${alertUid}: ${alert?.message ?? "no details available"}`;
           return {
-            content: [
-              { type: "text", text: JSON.stringify(payload ?? {}, null, 2) },
-            ],
+            content: [{ type: "text", text: summary }],
+            structuredContent: structuredContent ?? {},
           };
         }
 
@@ -804,27 +1156,40 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         }
 
         case "datto_list_components": {
-          const { name: nameFilter, max: maxParam } = args as {
-            name?: string;
-            max?: number;
-          };
-          const max = maxParam || 50;
-          const needle = nameFilter?.trim().toLowerCase();
-          // When filtering, scan a wider window so matches beyond the first
-          // page are not missed, then apply the max to the filtered result.
-          const all = await collectItems(
-            client.account.componentsAll(),
-            needle ? 1000 : max
-          );
-          const components = (all ?? [])
-            .filter((c) => !needle || c.name?.toLowerCase().includes(needle))
-            .slice(0, max);
+          const params = args as { name?: string; max?: number };
+          const max = params.max || 50;
+          const nameFilter = params.name?.trim().toLowerCase();
+
+          let matches: Component[];
+          let totalMatched: number;
+
+          if (nameFilter) {
+            // Filter across every page before truncating — otherwise a
+            // match on (say) page 5 of the catalogue would be missed just
+            // because non-matching components on earlier pages filled max.
+            const allMatches: Component[] = [];
+            for await (const component of client.account.componentsAll()) {
+              if (component.name?.toLowerCase().includes(nameFilter)) {
+                allMatches.push(component);
+              }
+            }
+            totalMatched = allMatches.length;
+            matches = allMatches.slice(0, max);
+          } else {
+            matches = await collectItems(client.account.componentsAll(), max);
+            totalMatched = matches.length;
+          }
+
           return {
             content: [
               {
                 type: "text",
                 text: JSON.stringify(
-                  { count: components.length, components },
+                  {
+                    totalMatched,
+                    returned: matches.length,
+                    components: matches.map(toComponentMatch),
+                  },
                   null,
                   2
                 ),
@@ -841,19 +1206,29 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
             variables?: Record<string, string>;
           };
 
-          const jobRequest = {
-            jobName,
+          // Public inputSchema keeps `variables` as a friendly key/value map
+          // (a nicer calling convention for an LLM) — convert to the array
+          // of {name, value} pairs the live API actually requires. See the
+          // QuickJobRequestBody comment above for why this nesting exists.
+          const jobRequest: QuickJobRequestBody = {
+            // Datto records the API account as the job's creator and offers no
+            // way to override it, so the caller's identity goes in the name -
+            // the one field that reaches the console's activity list. No-op
+            // when no gateway supplied one.
+            jobName: attributeJobName(jobName, requestContext?.callerUpn),
             jobComponent: {
               componentUid,
-              variables: variables
-                ? Object.entries(variables).map(([name, value]) => ({ name, value }))
-                : [],
+              variables: Object.entries(variables ?? {}).map(
+                ([name, value]) => ({ name, value })
+              ),
             },
           };
 
           const result = await client.devices.createQuickJob(
             deviceUid,
-            jobRequest as unknown as Parameters<typeof client.devices.createQuickJob>[1]
+            // The published library type for this parameter is the wrong
+            // flat shape — see the QuickJobRequestBody comment above.
+            jobRequest as unknown as QuickJobRequest
           );
           return {
             content: [
@@ -863,34 +1238,87 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
         }
 
         case "datto_get_job": {
-          const { jobUid, deviceUid, includeOutput } = args as {
-            jobUid: string;
-            deviceUid?: string;
-            includeOutput?: boolean;
-          };
-
+          const { jobUid } = args as { jobUid: string };
           const job = await client.jobs.get(jobUid);
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(job ?? {}, null, 2) },
+            ],
+          };
+        }
 
-          let result: Awaited<ReturnType<typeof client.jobs.results>> | undefined;
-          let stdout: string | undefined;
-          let stderr: string | undefined;
-
-          if (deviceUid) {
-            result = await client.jobs.results(jobUid, deviceUid);
-            if (includeOutput) {
-              [stdout, stderr] = await Promise.all([
-                client.jobs.stdout(jobUid, deviceUid),
-                client.jobs.stderr(jobUid, deviceUid),
-              ]);
-            }
-          }
-
+        case "datto_get_job_components": {
+          const { jobUid } = args as { jobUid: string };
+          const components = await client.jobs.components(jobUid);
           return {
             content: [
               {
                 type: "text",
-                text: JSON.stringify({ job, result, stdout, stderr }, null, 2),
+                text: JSON.stringify(components ?? [], null, 2),
               },
+            ],
+          };
+        }
+
+        case "datto_get_job_results": {
+          const { jobUid, deviceUid } = args as {
+            jobUid: string;
+            deviceUid: string;
+          };
+          const result = await client.jobs.results(jobUid, deviceUid);
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(result ?? {}, null, 2) },
+            ],
+          };
+        }
+
+        case "datto_get_job_stdout": {
+          const { jobUid, deviceUid } = args as {
+            jobUid: string;
+            deviceUid: string;
+          };
+          const stdout = await client.jobs.stdout(jobUid, deviceUid);
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(stdout ?? "", null, 2) },
+            ],
+          };
+        }
+
+        case "datto_get_job_stderr": {
+          const { jobUid, deviceUid } = args as {
+            jobUid: string;
+            deviceUid: string;
+          };
+          const stderr = await client.jobs.stderr(jobUid, deviceUid);
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(stderr ?? "", null, 2) },
+            ],
+          };
+        }
+
+        // The activity log is read directly (see device-jobs.ts for why the
+        // SDK's activityLogs resource can't be used); per-job outcomes go
+        // through the SDK's jobs resource like datto_get_job_results.
+        case "datto_list_device_jobs": {
+          const { deviceUid, since, until, name: jobName, max } = args as {
+            deviceUid: string;
+            since?: string;
+            until?: string;
+            name?: string;
+            max?: number;
+          };
+          const result = await listDeviceJobs(
+            creds,
+            deviceUid,
+            (jobUid) => client.jobs.results(jobUid, deviceUid.trim()),
+            { since, until, name: jobName, max }
+          );
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(result, null, 2) },
             ],
           };
         }
@@ -915,19 +1343,45 @@ export function createMcpServer(credentialOverrides?: DattoCredentials): Server 
           };
         }
 
+        // Not wrapped by the SDK yet (see src/patches.ts's header comment) -
+        // these two call Datto RMM's v2 patch endpoints directly rather than
+        // through `client`.
+        case "datto_get_device_patches": {
+          const { deviceUid } = args as { deviceUid: string };
+          const result = await getDevicePatches(creds, deviceUid);
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(result ?? {}, null, 2) },
+            ],
+          };
+        }
+
+        case "datto_get_site_patches": {
+          const { siteUid } = args as { siteUid: string };
+          const result = await getSitePatches(creds, siteUid);
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(result ?? {}, null, 2) },
+            ],
+          };
+        }
+
         default:
           return {
             content: [{ type: "text", text: `Unknown tool: ${name}` }],
             isError: true,
           };
       }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: "text", text: `Error: ${message}` }],
-        isError: true,
-      };
-    }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: `Error: ${message}` }],
+          isError: true,
+        };
+      }
+    })();
+
+    return applyUntrustedContentMarkers(name, result);
   });
 
   return server;

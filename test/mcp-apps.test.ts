@@ -22,9 +22,9 @@ import { ALERT_CARD_HTML } from "../src/generated/alert-card-html.js";
 
 const mockAlertsGet = vi.fn();
 
-vi.mock("@wyre-technology/node-datto-rmm", async (importOriginal) => {
+vi.mock("@wyre-ai/node-datto-rmm", async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import("@wyre-technology/node-datto-rmm")>();
+    await importOriginal<typeof import("@wyre-ai/node-datto-rmm")>();
   return {
     ...actual,
     DattoRmmClient: class {
@@ -198,10 +198,26 @@ describe("MCP Apps alert card", () => {
       );
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
-        result?: { isError?: boolean; content?: { text?: string }[] };
+        result?: {
+          isError?: boolean;
+          content?: { text?: string }[];
+          structuredContent?: Record<string, unknown>;
+        };
       };
       expect(body.result?.isError).toBeFalsy();
-      const payload = JSON.parse(body.result?.content?.[0]?.text ?? "{}");
+      // datto_get_alert is untrusted-content-marked (src/untrusted-content.ts):
+      // the human summary in content is wrapped in a <datto-data> boundary.
+      // The raw alert plus _card lives in structuredContent.
+      const rawText = body.result?.content?.[0]?.text ?? "";
+      const match = /^<datto-data>\n([\s\S]*)\n<\/datto-data>\n\n/.exec(rawText);
+      expect(match).not.toBeNull();
+      expect(match?.[1]).toBe(
+        "Alert on SRV-DC01: Disk Usage (Critical, Open)"
+      );
+      const payload = body.result?.structuredContent as Record<
+        string,
+        unknown
+      >;
       expect(payload.alertUid).toBe(openAlert.alertUid);
       expect(payload.message).toBe(openAlert.message);
       expect(payload._card).toEqual({
